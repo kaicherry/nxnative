@@ -94,5 +94,28 @@ int main(void) {
     assert(jc1_decode(&s, r, 49, 1, &cal, fall, p) == 3 && p[2].acc[0] == 0 && p[2].rot[2] == 0);
     assert(!jc1_decode(&s, r, 49, 1, &cal, fall + JC1_STALE_NS + 1, p));
     assert(!s.live);
+    // The gyro's still offset: a second of still samples gives their mean, and the samples are taken against the factory's origin plus it
+    {
+        jc1_rest r = {0};
+        int16_t res[6] = {10, -20, 30, 40, -50, 60};   // the accelerometer still, the gyro reading 40/-50/60 counts off
+        for (int i = 0; i < JC1_REST_N; i++) jc1_rest_update(&r, res);
+        assert(r.have && fabsf(r.bias[0] - 40.f) < 1e-4f && fabsf(r.bias[1] + 50.f) < 1e-4f && fabsf(r.bias[2] - 60.f) < 1e-4f);
+        int16_t origin[3] = {5, 25, 2};
+        jc1_rest_apply(&cal, &r, origin);
+        assert(fabsf(cal.gyro_offset[0] - 45.f) < 1e-4f && fabsf(cal.gyro_offset[1] + 25.f) < 1e-4f && fabsf(cal.gyro_offset[2] - 62.f) < 1e-4f);
+        // moving: the window starts again, and a mean past 60 counts (a slow turn) is not taken
+        jc1_rest r2 = {0};
+        for (int i = 0; i < JC1_REST_N - 1; i++) jc1_rest_update(&r2, res);
+        res[3] = 500; jc1_rest_update(&r2, res);
+        assert(!r2.have && !r2.n);
+        for (int i = 0; i < JC1_REST_N; i++) { res[3] = 80; res[4] = -90; res[5] = 100; jc1_rest_update(&r2, res); }
+        assert(!r2.have);   // 80 counts is 4.9 deg/s: a slow turn, not rest
+        for (int i = 0; i < JC1_REST_N; i++) { res[3] = 20; res[4] = -30; res[5] = 40; jc1_rest_update(&r2, res); }
+        assert(r2.have && fabsf(r2.bias[0] - 20.f) < 1e-4f);
+        int16_t o2[3] = {0, 0, 0};
+        jc1_rest_apply(&cal, &r2, o2);
+        assert(fabsf(cal.gyro_offset[0] - 20.f) < 1e-4f);
+    }
+
     puts("t_jc1: passed");
 }

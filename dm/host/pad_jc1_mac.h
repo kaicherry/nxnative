@@ -19,7 +19,8 @@
 typedef struct jc1_dev {
     IOHIDDeviceRef hid; int pid, left;
     uint8_t report[512], counter;
-    jc1_cal cal; jc1_stream stream;
+    jc1_cal cal; jc1_stream stream; jc1_rest rest;
+    int16_t origin[3];              // the factory's gyro origin, before the learned rest offset
     uint64_t last_report, last_reset, logged;
     int said;
     struct jc1_dev *next;
@@ -83,15 +84,35 @@ static void jc1_report(void *ctx, IOReturn result, void *sender, IOHIDReportType
     jc1_dev *d = ctx;
     if (result != kIOReturnSuccess || type != kIOHIDReportTypeInput) return;
     if (report_id == 0x21) {
-        if (jc1_parse_cal(&d->cal, r, (size_t)len) && g_jc1_log)
-            LOG("[jc1] %s Joy-Con: factory IMU calibration read (gyro %.4f/%.4f/%.4f deg/s per count)", d->left ? "left" : "right",
-                d->cal.gyro_scale[0], d->cal.gyro_scale[1], d->cal.gyro_scale[2]);
+        if (jc1_parse_cal(&d->cal, r, (size_t)len) && g_jc1_log) {
+            for (int i = 0; i < 3; i++) d->origin[i] = (int16_t)d->cal.gyro_offset[i];   // the factory's origin, before the learned rest
+            memset(&d->rest, 0, sizeof d->rest);   // what was learned without it is of no use now
+            LOG("[jc1] %s Joy-Con: factory IMU calibration read (gyro %.4f/%.4f/%.4f deg/s per count, origin %.0f/%.0f/%.0f counts)",
+                d->left ? "left" : "right", d->cal.gyro_scale[0], d->cal.gyro_scale[1], d->cal.gyro_scale[2],
+                d->origin[0], d->origin[1], d->origin[2]);
+        }
         return;
     }
     if (report_id != 0x30) return;
     uint64_t now = now_ns();
     d->last_report = now;
     if (!d->said && g_jc1_log) { d->said = 1; LOG("[jc1] %s Joy-Con (pid 0x%04x): report 0x30 at %ld bytes", d->left ? "left" : "right", d->pid, (long)len); }
+    // The controller's own still offset, from a second of samples in which it hardly moves (jc1_rest_update)
+    for (int k = 0; k < 3; k++) {
+        const uint8_t *b = r + 13 + 12 * k;
+        int16_t res[6];
+        for (int i = 0; i < 3; i++) { res[i] = jc1_s16(b + 2 * i); res[3 + i] = (int16_t)(jc1_s16(b + 6 + 2 * i) - d->origin[i]); }
+        jc1_rest_update(&d->rest, res);
+    }
+    jc1_rest_apply(&d->cal, &d->rest, d->origin);
+    if (g_jc1_log >= 3 && now - d->logged > 1000000000ull) {   // the chip's own counts, against the calibration's origin
+        d->logged = now;
+        const uint8_t *b = r + 13 + 12 * 2;
+        LOG("[jc1] %s Joy-Con raw: accel %d/%d/%d gyro %d/%d/%d counts (origin %d/%d/%d, the rest offset %.0f/%.0f/%.0f)",
+            d->left ? "left" : "right", jc1_s16(b), jc1_s16(b + 2), jc1_s16(b + 4),
+            jc1_s16(b + 6), jc1_s16(b + 8), jc1_s16(b + 10),
+            d->origin[0], d->origin[1], d->origin[2], d->rest.bias[0], d->rest.bias[1], d->rest.bias[2]);
+    }
     jc1_sample s[JC1_IMU_SAMPLES];
     int n = jc1_decode(&d->stream, r, (size_t)len, d->left, &d->cal, now, s);
     int p = jc1_player_of();

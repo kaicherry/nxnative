@@ -82,6 +82,31 @@ typedef struct { int live, seen; uint8_t counter; uint64_t received, clock, emit
 typedef struct { float acc[3], rot[3]; uint64_t ns; } jc1_sample;
 enum { JC1_STALE_NS = 300000000 };
 
+// The gyro's still offset. The factory's origin is close but not the unit's own: one here read 5/25/2 counts against a rest offset of tens of counts, and what is left over (a
+// degree or two per second) integrates into a drift the game reads as the player's hands moving. A second of samples in which the gyro and the accelerometer hardly vary is a
+// controller lying or held still; their mean is the offset (blended with the one before). An offset past 3.7 degrees per second (60 counts) is not taken: that is a slow turn,
+// not rest. The Switch 2 transport learns the same thing for its Joy-Con 2 (s2_rest_update).
+#define JC1_REST_N 200   // about a second of samples, 5 ms apart
+typedef struct { int n, have; int32_t sum[3]; int16_t gmin[3], gmax[3], amin[3], amax[3]; float bias[3]; } jc1_rest;
+static inline void jc1_rest_update(jc1_rest *r, const int16_t res[6]) {
+    if (!r->n) for (int i = 0; i < 3; i++) { r->sum[i] = 0; r->gmin[i] = r->gmax[i] = res[3 + i]; r->amin[i] = r->amax[i] = res[i]; }
+    for (int i = 0; i < 3; i++) {
+        r->sum[i] += res[3 + i];
+        if (res[3 + i] < r->gmin[i]) r->gmin[i] = res[3 + i]; if (res[3 + i] > r->gmax[i]) r->gmax[i] = res[3 + i];
+        if (res[i] < r->amin[i]) r->amin[i] = res[i]; if (res[i] > r->amax[i]) r->amax[i] = res[i];
+        if (r->gmax[i] - r->gmin[i] > 100 || r->amax[i] - r->amin[i] > 300) { r->n = 0; return; }   // moving: the window starts again
+    }
+    if (++r->n < JC1_REST_N) return;
+    r->n = 0;
+    float m[3]; for (int i = 0; i < 3; i++) { m[i] = (float)r->sum[i] / JC1_REST_N; if (fabsf(m[i]) > 60.f) return; }
+    for (int i = 0; i < 3; i++) r->bias[i] = r->have ? 0.5f * r->bias[i] + 0.5f * m[i] : m[i];
+    r->have = 1;
+}
+// The offset the samples are taken against: the factory's origin plus what the controller's own rest shows.
+static inline void jc1_rest_apply(jc1_cal *c, const jc1_rest *r, const int16_t origin[3]) {
+    for (int i = 0; i < 3; i++) c->gyro_offset[i] = (float)origin[i] + (r->have ? r->bias[i] : 0.f);
+}
+
 // Decodes three samples; 0 for a short or repeated report, or for the zeroed IMU of a controller whose sensor
 // is off (until it has been on once: later zeros are a real fall). acc is the gravity direction in G and rot
 // radians/s, in the host's Switch frame; ns is each sample's own time, the third block the newest.
