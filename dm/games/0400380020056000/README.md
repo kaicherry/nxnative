@@ -21,7 +21,7 @@ Render conditions, which the host evaluates for every game ([Conditional renderi
 
 ## Shaders
 
-27,192 of 27,195 built on chain `9bb5d8678204`. Of the 3 that did not, the one on instruction 0x481 was a false row, gone from the tables since they were split again (resolved, below); the other 2, compute shaders of `agl_technique_pfx` that Metal refused (`bracket nesting level exceeded`), have not been built since 04df08d4 raised Metal's bracket depth (unchecked). `fa072659664b2d38` in `agl_common`, which the game asks for at boot, builds now.
+27,192 of 27,192 built on chain `6832d4cf829f`, a full rebuild from scratch on the M4 Pro (35:53, nothing from the Metal cache). That resolves the 3 an earlier chain left: the false row on instruction 0x481 had gone from the tables since they were split again, and the two compute shaders of `agl_technique_pfx` that Metal refused (`bracket nesting level exceeded`) build now that Metal's bracket depth is raised. `fa072659664b2d38` in `agl_common`, which the game asks for at boot, builds.
 
 ## Rendering
 
@@ -46,6 +46,7 @@ The work folder's `run/drive.sh <name> <secs> "<sec> <control line>"…` boots i
 - An IPA: the 16 GB alias region is over iOS's limit until the SDK 21 cuts are ported.
 - A crash dump once hung in `flockfile` under `shader_load`, with the log contended.
 - `dm/games/profile_guess.py` does not recognise `Generic_21_4_4`. `pl::IsRunningOnOunce` answers false.
+- Whether the game reads controller motion at all (the second-game test for original Joy-Cons): not established. A fresh build on chain `6832d4cf829f` boots and ran 6,900 frames at 60 fps (p50 16.68 ms, 4.2 GB footprint) with no `[RED]` line, but no controller was awake to try it with.
 
 ## Found on this game
 
