@@ -2,16 +2,12 @@
 
 ## Next action
 
-Play the Boxing round, on the current build. Branch `feature/joycon1-motion` is rebased onto
-`origin/main` and the chain is now `b6aa8fd968b7`; Nintendo Switch Sports Resort's libraries and
-host were rebuilt for it on 2026-11-13 (11,053 of its 11,059 shaders: the 6 refusals are the
-game's own mesh/task shaders with payloads past Metal's 16 KB, [issue
-#1753](https://github.com/seedds/nxnative/issues/1753), which no draw has been seen to use), and
-the app bundle `Nintendo Switch Sports Resort.app` was re-packed with them. Run
-`/Volumes/X9BS/resort/tools/dmhost` with the command the NSP script printed, or the app, with
-`DM_JC1_LOG=2`; play one round, hands still at the end, and read the host's stream (|acc| and
-rotation) against what the avatar does. This is the round that tests the still-offset learning,
-which the gyro-scale normalization did not need.
+Nothing is left on hardware: Boxing is clean with the still offset taken off (below). The branch is
+rebased onto `origin/main`, the host suite passes, and the PR's remaining red checks are main's own.
+Refresh PR #4's description with the Boxing round and the Splatoon Raiders result, and keep
+`regress.py check --games` out of it (no local game has a Mac build here) unless a machine with one
+turns up. The local builds are on chain `b6aa8fd968b7`, one behind main's `d6b05d7481e5`; rebuild
+when the game is next played.
 
 ## Goal
 
@@ -97,9 +93,12 @@ Mac, macOS 27.2, Nintendo Switch Sports Resort.
   Thumb Wrestling and Bowling work; Tennis worked before the per-side change and has not been
   retested since.
 - Boxing (two-handed): fine at first, then the avatar throws punches while the player is still.
-  After the round, with the controllers at rest, the host's stream was clean (|acc| 1.00-1.02 G,
-  rotation under 1.1 deg/s on both sides). That rules out jitter at rest; whether the transport
-  drifts the game's fusion during motion is NOT established.
+  **Resolved 2026-11-13**: with each controller's own still offset learned and taken off, a 22 minute
+  session (80,760 frames, frame p50 16.66 ms, one re-sent handshake, no re-calibration) threw no
+  punches while the player held still, and the host's stream stayed clean (the left, on the desk for
+  about ten minutes, held a 0.06 deg/s residual; the right, held, never fell below about 1.3 deg/s).
+  The two builds before this one, with the factory origin alone and with the gyro scale normalized,
+  both threw them.
 - One mid-session dropout: `controller 'Joy-Con (L/R)' disconnected: player 1 (npad 0) is free`,
   then `controller connected: Joy-Con (R) (no extended gamepad profile: not used)`. Pressing + on
   the controller brought it back (a button press wakes a dropped Joy-Con). Right Joy-Con RSSI was
@@ -107,24 +106,28 @@ Mac, macOS 27.2, Nintendo Switch Sports Resort.
 - Raw stream measurements: report rate ~60-67 Hz, three samples per report 5 ms apart; real
   punches reached 9.9 G and 18 rad/s; arrival lag p50 6-9 ms, max ~68 ms.
 
-## Last change: the gyro's still offset (played, did not fix Boxing)
+## Last change: the gyro's still offset (played — it was the cause)
 
 The gyro-scale normalization went first: the left unit's stored coefficient was 0x3BE7 (15335)
 against the right's default 0x343B (13371), the 936/816 ratio, so with one constant the left
 integrated 13% slow (0.0532 against the part's 0.0610 deg/s per count). Normalized, both read
-0.0611/0.0611/0.0610 (left) and 0.0610/0.0609/0.0610 (right). A round played with it still had
-the avatar punching while the player was still, so the scale was not the cause.
+0.0611/0.0611/0.0610 (left) and 0.0610/0.0609/0.0610 (right). A round played with it still had the
+avatar punching while the player was still, so the scale was not the cause.
 
-The still offset came next: the factory origin is close but not the unit's own (the left read
-5/25/2 counts against a rest offset of tens), so the host now learns the controller's own offset
-from a second of near-constant samples, as the Switch 2 transport does. Measured residuals 11/-3/-7
-counts on the left and 4/2/4 on the right. **Not yet played**: this is the round the next action
-asks for.
+The still offset was: the factory origin is close but not the unit's own (the left read 5/25/2
+counts against a rest offset of tens), so the host learns the controller's own offset from a second
+of near-constant samples, as the Switch 2 transport does. **A 22 minute session (80,760 frames,
+p50 16.66 ms) with both hands held still threw no punches.** The learned offsets settled at
+-1/-2/46 counts (left) and 9/-8/-15 (right); the left, which lay on the desk for about ten minutes,
+held a 0.06 deg/s residual, and the right, a held pad, never fell below about 1.3 deg/s — the
+difference between a desk and a hand, not a drift. One handshake was re-sent in the session and
+re-calibrated nothing.
 
 ## Open questions
 
-1. ~~Does the gyro-scale normalization stop the boxing phantom punches?~~ Answered: no. The still
-   offset is the next cause taken off, and its round is the next action.
+1. ~~Does the gyro-scale normalization stop the boxing phantom punches?~~ Answered: no. ~~Did the
+   still offset?~~ Answered: yes — a 22 minute session threw no punches with both hands still, so
+   the factory origin's leftover bias was the cause.
 2. Why did the combined pad disconnect mid-session (battery? macOS pairing?) and why does a lone
    Joy-Con arrive with no extended gamepad profile and get ignored by the front end?
 3. Should a pair's two sensor frames be common or per-device? A flat pose agrees on both; mirrored
