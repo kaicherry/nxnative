@@ -36,6 +36,10 @@ Render conditions, which the host evaluates for every game ([Conditional renderi
 
 The game writes 29 `ReportCounter(TIMESTAMP_TOP)` reports a frame and steers its dynamic resolution by the GPU time between them ([issue #1064](https://github.com/seedds/nxnative/issues/1064), M2 Air, 1920x1080 handheld). With one time for the whole submission it read about 0 and kept the 3D view at 1440x810 (render scale 0.75) at 26 ms of GPU a frame; with segment times it scaled between 0.39 and 1.0 of the render-scale size. With the GPU's idle gaps between command buffers counted it read about 16 ms where the GPU worked about 8 and held 0.50–0.57 of full size; without them its width median went to 0.94, and dropped frames from 4 to 35 per 300 ([issue #1290](https://github.com/seedds/nxnative/issues/1290)). Both are the host's default now ([GPU timestamps per submission segment](../../../docs/reference/frame-rate.md#gpu-timestamps-per-submission-segment)); not rerun on main.
 
+## Motion controls
+
+Motion aiming works with a pair of original (Switch 1) Joy-Cons, clean and 1 to 1 by the player's account, and this is the second game that proves the Mac transport (`pad_jc1.h`; [the reference entry](../../../docs/reference/services.md#an-original-joy-cons-sensors-are-read-by-the-host)). A 7 minute session reached frame 26,100 with no `[RED]` line and called `GetSixAxisSensorStates` 30,400 times, 1.16 a frame, and never the npad IMU API (`GetNpadImuSamples` 0), so the game reads the six-axis sensors itself and the SDK's fusion, which over-samples them in Sports Resort, is not in this path. The stream carried the motion: 444 deg/s peak from the left half and 484 from the right, against 1.27 rev/s handed to player 1. Both halves report their own gravity at rest (left −1.02, right −1.01 G, rotation under 0.2 deg/s) and the factory gyro scale normalizes to 0.0611 deg/s per count on both. The game supports FullKey | Handheld | JoyDual (0x7), so the pair is shown as one full-key controller with one six-axis handle, fed by the player's merged stream, which is the right half (`DM_JC1_SIDE=L` picks the other; the left half's own stream goes unread here). Frame p50 16.8-21.2 ms and GPU p50 9.2-13.3 ms in the last windows of that session.
+
 ## Driving it on the Mac
 
 The work folder's `run/drive.sh <name> <secs> "<sec> <control line>"…` boots in a window with the HUD, raises it and appends control lines (`A~0.1`, `LUp~4`, `shot <path>`, `passdump 1`, `texdump <path with %d>`). With the save at the start of the dialogue, four presses of A get to the beach at about 75 s. `DM_NVN_SHOT=<frames>:<relative path>` takes consecutive frames: the path must have no space, as the driver's environment is split on them.
@@ -46,7 +50,6 @@ The work folder's `run/drive.sh <name> <secs> "<sec> <control line>"…` boots i
 - An IPA: the 16 GB alias region is over iOS's limit until the SDK 21 cuts are ported.
 - A crash dump once hung in `flockfile` under `shader_load`, with the log contended.
 - `dm/games/profile_guess.py` does not recognise `Generic_21_4_4`. `pl::IsRunningOnOunce` answers false.
-- Whether the game reads controller motion at all (the second-game test for original Joy-Cons): not established. A fresh build on chain `6832d4cf829f` boots and ran 6,900 frames at 60 fps (p50 16.68 ms, 4.2 GB footprint) with no `[RED]` line, but no controller was awake to try it with.
 
 ## Found on this game
 
