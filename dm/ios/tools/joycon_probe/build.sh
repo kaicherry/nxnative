@@ -13,6 +13,7 @@ mkdir -p "$app"
 xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -fobjc-arc -O1 -g \
     -framework UIKit -framework GameController -framework CoreGraphics \
     -o "$app/JoyConProbe" "$here/main.m"
+rm -rf "$app"/*.dSYM            # clang -g leaves one beside the binary; an app bundle holds none
 cp "$here/Info.plist" "$app/Info.plist"
 codesign --force --sign - "$app/JoyConProbe"
 (cd "$out" && zip -qr "$out/JoyConProbe.ipa" Payload)
