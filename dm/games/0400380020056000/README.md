@@ -21,7 +21,7 @@ Render conditions, which the host evaluates for every game ([Conditional renderi
 
 ## Shaders
 
-27,192 of 27,192 built on chain `6832d4cf829f`, a full rebuild from scratch on the M4 Pro (35:53, nothing from the Metal cache). That resolves the 3 an earlier chain left: the false row on instruction 0x481 had gone from the tables since they were split again, and the two compute shaders of `agl_technique_pfx` that Metal refused (`bracket nesting level exceeded`) build now that Metal's bracket depth is raised. `fa072659664b2d38` in `agl_common`, which the game asks for at boot, builds.
+27,192 of 27,192 built on chain `b6aa8fd968b7`, a full rebuild from scratch on the M4 Pro (31:24, nothing from the Metal cache), and so did the chain before it (`6832d4cf829f`, 35:53): the false row on instruction 0x481 is gone since the tables were split again, and the two compute shaders of `agl_technique_pfx` that Metal refused (`bracket nesting level exceeded`) build now that Metal's bracket depth is raised. `fa072659664b2d38` in `agl_common`, which the game asks for at boot, builds.
 
 ## Rendering
 

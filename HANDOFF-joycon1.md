@@ -2,16 +2,16 @@
 
 ## Next action
 
-Get a runnable Resort build again, then play the Boxing round. The app bundle's shader
-libraries are chain `3856a9225d68` and the tree's chain is `6832d4cf829f`, and the host loads
-only libraries of its own chain version, so the current tree's host cannot use the app as it
-stands; its `dmhost` also predates the still-offset change. Rebuild with
-`scripts/build_ipa_from_nsp.py "/Volumes/Segan/TheSources/Nintendo Switch Sports Resort
-[04008E001F098000][v65536].nup" --platform mac --work-dir /Volumes/X9BS/resort` (11,062
-shaders; `/Volumes/X9BS/resort/shader/cache/cas.db` should let the Metal compiles be reused),
-then either run `/Volumes/X9BS/resort/tools/dmhost` with the command the script prints, or
-re-pack the app with `--platform mac-app`. Play one Boxing round with `DM_JC1_LOG=2`, hands
-still at the end, and read the host's stream (|acc| and rotation) against what the avatar does.
+Play the Boxing round, on the current build. Branch `feature/joycon1-motion` is rebased onto
+`origin/main` and the chain is now `b6aa8fd968b7`; Nintendo Switch Sports Resort's libraries and
+host were rebuilt for it on 2026-11-13 (11,053 of its 11,059 shaders: the 6 refusals are the
+game's own mesh/task shaders with payloads past Metal's 16 KB, [issue
+#1753](https://github.com/seedds/nxnative/issues/1753), which no draw has been seen to use), and
+the app bundle `Nintendo Switch Sports Resort.app` was re-packed with them. Run
+`/Volumes/X9BS/resort/tools/dmhost` with the command the NSP script printed, or the app, with
+`DM_JC1_LOG=2`; play one round, hands still at the end, and read the host's stream (|acc| and
+rotation) against what the avatar does. This is the round that tests the still-offset learning,
+which the gyro-scale normalization did not need.
 
 ## Goal
 
@@ -136,9 +136,9 @@ asks for.
 ## Second game: Splatoon Raiders (done — motion aiming works)
 
 `/Volumes/X9BS/splatoon-raiders` holds the dump folder's build
-(`0400380020056000_build`, chain `6832d4cf829f`, all 27,192 shaders) and
-`README-validation.md`. Its host is current: the Joy-Con code and the still-offset change are in
-it.
+(`0400380020056000_build`, rebuilt for chain `b6aa8fd968b7` on 2026-11-13: all 27,192 shaders,
+31:24, host rebuilt) and `README-validation.md`. Its host is current: the Joy-Con code and the
+still-offset change are in it.
 
 **Answer: the game reads motion every frame and acts on it.** A 7 minute session with a left and
 a right original Joy-Con aimed cleanly and 1 to 1; the game called `GetSixAxisSensorStates`
@@ -159,8 +159,11 @@ command: `$B` expands before the assignment applies.
 
 ## Verification state
 
-- The whole host suite passes on the branch head (`make -C dm/host/tests GAME=04008E001F098000 run`,
-  0 failed), run for both `fde4adb2` and `835196d9`; `t_jc1` and `t_hid` (463 checks) included.
+- Rebased onto `origin/main` (`b1e44c17`) with no conflicts; 7 commits, 0 behind.
+- The whole host suite passes on the rebased tree (`make -C dm/host/tests GAME=04008E001F098000 run`,
+  exit 0, every file 0 failed; `hid players` 463 checks), as it did for `fde4adb2` and `835196d9`
+  before the rebase.
+- `t_jc1` and `t_hid` cover the transport and the per-handle streams; nothing in them changed here.
 - **PR #4's red checks are main's, not the branch's.** `clang-tidy (ratchet)` fails on 5 new
   findings in `dm/gfx/tests/*.m` under LLVM 23.1.4, and "Host unit tests" fails `t_save_sync`'s
   "both changed: the report says conflict, with the cloud's device". Origin/main's own runs
@@ -209,12 +212,12 @@ DM_SAVE=/tmp/macsave DM_FOCUS_KEEP=1 DM_WINDOW=1 DM_AUDIO=1 DM_ROMFS=/Volumes/X9
 
 ## Current tree state
 
-- Branch `feature/joycon1-motion`, head `ca1f06b9` (pushed), **PR #4** open.
-- Committed since this handoff was written: `5fb1e8db` (host build depends on the Joy-Con
-  headers), `835196d9` (the still offset), `e77298c1`, `804d6b96` (docs and the game note),
-  `ca1f06b9` (Splatoon Raiders' shader build).
-- Uncommitted (this session): `dm/games/0400380020056000/README.md` (motion controls),
-  `docs/reference/services.md` (Splatoon Raiders in Found on and Open), `docs/agents/symptoms.md`
-  (regenerated), plus the pre-existing `.gitignore` change (`./.rnsk-memory`).
-- The host binary `dm/host/dmhost` is untracked build output and predates the still offset; the
-  next action rebuilds through the NSP script anyway.
+- Branch `feature/joycon1-motion`, rebased onto `origin/main` (`b1e44c17`), 7 commits ahead.
+- Committed: `fde4adb2` (the transport), `5fb1e8db` (host build depends on the Joy-Con headers),
+  `835196d9` (the still offset), `e77298c1`, `804d6b96` (docs and the game note), `ca1f06b9`
+  (Splatoon Raiders' shader build), the Splatoon motion result, and this handoff.
+- `.gitignore`'s `./.rnsk-memory` change is unrelated and stays out of these commits.
+- Local builds, all on chain `b6aa8fd968b7`: `/Volumes/X9BS/resort` (11,053/11,059 shaders, host,
+  pipeline prebuild) and `Nintendo Switch Sports Resort.app` (repacked 2026-11-13);
+  `/Volumes/X9BS/splatoon-raiders/0400380020056000_build` (27,192/27,192, host, prebuild).
+- `dm/host/dmhost` in the checkout is untracked build output.
