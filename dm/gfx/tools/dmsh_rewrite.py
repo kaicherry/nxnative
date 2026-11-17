@@ -708,6 +708,95 @@ static inline __attribute__((always_inline)) void dm_blend0(thread main0_out& dm
 BLEND_ZERO_PARAM = f'constant dm_blend_state& dm_blend [[buffer({abi.BLEND_BUFFER})]]'
 
 
+# Page folding for textures taller than Metal's 2D limit: a texture the host split into an array of equal pages, where the game's own v runs over the whole
+# texture and its layer coordinate is 0 (see abi.DMSH_KIND_FOLD). A sample folds v into the page it lands in and the row within it; n = 1 (the texture is not
+# split) leaves the coordinate and the layer exactly as the game gave them, which is every sample but a split texture's
+FOLD_HELPERS = f'''struct dm_fold_t {{ uint n[{abi.FOLD_SLOTS}]; }};
+static inline __attribute__((always_inline)) float2 dm_fuv(float2 uv, uint n)
+{{
+    if (n <= 1u) return uv;
+    float y = uv.y * float(n), p = floor(y);
+    return float2(uv.x, y - p);
+}}
+static inline __attribute__((always_inline)) uint dm_fpage(float2 uv, uint layer, uint n)
+{{
+    return n <= 1u ? layer : uint(floor(uv.y * float(n)));
+}}
+template<typename V, typename S, typename... A> static inline __attribute__((always_inline)) auto dm_fs(V t, S s, float2 uv, uint layer, uint n, A... a) -> decltype(t.sample(s, uv, layer, a...))
+{{
+    return t.sample(s, dm_fuv(uv, n), dm_fpage(uv, layer, n), a...);
+}}
+template<typename V, typename C, typename... A> static inline __attribute__((always_inline)) auto dm_fr(V t, C xy, uint layer, uint n, A... a) -> decltype(t.read(xy, layer, a...))
+{{
+    if (n <= 1u) return t.read(xy, layer, a...);
+    uint h = uint(t.get_height());
+    return t.read(C(xy.x, xy.y % h), uint(xy.y / h), a...);
+}}
+template<typename V, typename S, typename... A> static inline __attribute__((always_inline)) auto dm_fc(V t, S s, float2 uv, uint layer, uint n, A... a) -> decltype(t.sample_compare(s, uv, layer, a...))
+{{
+    return t.sample_compare(s, dm_fuv(uv, n), dm_fpage(uv, layer, n), a...);
+}}
+'''
+
+FOLD_CALLS = (('sample_compare', 'dm_fc'), ('sample', 'dm_fs'), ('read', 'dm_fr'))
+
+def split_top(text):
+    """The top-level comma-separated arguments of an argument list (text is what lies between the parentheses). A '<' opens a template's argument list, which
+    holds commas of its own, but a member access's arrow is not one of its angles: dm_fold->n[0] closes nothing"""
+    args, cut, d = [], 0, 0
+    for j, c in enumerate(text):
+        if c == '>' and j and text[j - 1] == '-': continue
+        if c == '<' and (j == 0 or not (text[j - 1].isalnum() or text[j - 1] in '_:')): continue
+        if c in '(<[': d += 1
+        elif c in ')>]': d -= 1
+        elif c == ',' and d == 0: args.append(text[cut:j].strip()); cut = j + 1
+    args.append(text[cut:].strip())
+    return args
+
+def call_span(msl, at):
+    """(the index after the parenthesis closing the call whose argument list starts at at, its arguments)"""
+    depth, i = 1, at
+    while depth:
+        if i >= len(msl): raise ValueError('an argument list that does not end')
+        depth += {'(': 1, ')': -1}.get(msl[i], 0); i += 1
+    return i, split_top(msl[at:i - 1])
+
+def fold_pages(msl):
+    """Samples and fetches of a 2D array texture member fold v into the page the host holds the texture in, through the page count the host binds per member
+    (abi.KIND_FOLD): T.sample(S, uv, layer, ...) → dm_fs(T, S, uv, layer, n, ...). Both the sample and a border colour's twin (border_emu) sample the same
+    page. The source unchanged when it samples no 2D array texture"""
+    body = re.search(r'struct spvDescriptorSetBuffer0\s*\{(.*?)\};', msl, re.S)
+    if not body: return msl
+    members = [(m.group(1).strip(), m.group(2), int(m.group(3))) for m in re.finditer(r'^\s*(.+?)\s+(\w+)\s*\[\[id\((\d+)\)(?:\s*,\s*\w+\(\d+\))*\]\];', body.group(1), re.M)]
+    slots = {n: aid for ty, n, aid in members if re.fullmatch(r'(texture|depth)2d_array<[^;]*>', ty)}
+    if not slots: return msl
+    if not any(m.group(1) in slots for m in re.finditer(r'spvDescriptorSet0\.(\w+)\.(?:sample_compare|sample|read)\(', msl)): return msl
+    nid = max(aid + (int(a.group(1)) if (a := re.fullmatch(r'array<.*,\s*(\d+)>', ty)) else 1) for ty, _, aid in members)
+    end = body.end(1)
+    msl = msl[:end] + ('' if msl[end - 1] == '\n' else '\n') + f'    constant dm_fold_t* {abi.FOLD_MEMBER} [[id({nid})]];\n' + msl[end:]
+    # the calls, the last first: one that sits in another's arguments is rewritten before the outer one copies them, and a rewrite never moves an offset not yet used
+    calls = sorted((m for m in re.finditer(r'spvDescriptorSet0\.(\w+)\.(sample_compare|sample|read)\(', msl) if m.group(1) in slots),
+                   key=lambda m: m.start(), reverse=True)
+    for m in calls:
+        i, args = call_span(msl, m.end())
+        kind = m.group(2)
+        # the layer is the call's argument after its texture-wide ones: xy, layer for read (the texture is the helper's first), sampler, uv, layer for a sample.
+        # n is the helper's argument after the layer (dm_fs / dm_fc take uv, layer, n; dm_fr takes xy, layer, n), so it goes in just past the layer's index
+        after_layer = 3 if kind != 'read' else 2
+        if len(args) < after_layer: continue   # not a 2D array's sample or fetch: the texture has no layer to fold against
+        call, n = 'spvDescriptorSet0.' + m.group(1), f'spvDescriptorSet0.{abi.FOLD_MEMBER}->n[{slots[m.group(1)]}]'
+        helper = 'dm_fr' if kind == 'read' else 'dm_fc' if kind == 'sample_compare' else 'dm_fs'
+        msl = msl[:m.start()] + f'{helper}({call}, ' + ', '.join(args[:after_layer] + [n] + args[after_layer:]) + ')' + msl[i:]
+        if kind == 'read': continue
+        # a border colour's twin (dm_bs, border_emu) samples the same coordinates through another sampler: it folds them too, or it reads another page
+        wrap = m.start() - len('dm_bs(')
+        if wrap >= 0 and msl[wrap:wrap + 6] == 'dm_bs(':
+            wend, wargs = call_span(msl, wrap + 6)
+            if len(wargs) >= 7:   # the sample, the block, its bit, the texture, the twin, then the sample's own arguments
+                wargs[5], wargs[6] = f'dm_fuv({wargs[5]}, {n})', f'dm_fpage({wargs[5]}, {wargs[6]}, {n})'
+                msl = msl[:wrap + 6] + ', '.join(wargs) + msl[wend - 1:]
+    return msl.replace('using namespace metal;\n', 'using namespace metal;\n' + FOLD_HELPERS, 1)
+
 def blend_zero(msl):
     """→ (msl with dm_blend0(out, dm_blend); before each `return out;` line of main0, the word as main0's last parameter and the helpers before main0, the number of returns guarded).
     Unchanged (0) when main0 has no float4 colour output, is not of a shape dmsh_side.entry knows, has its body shared already, or returns other than on a line of its own"""

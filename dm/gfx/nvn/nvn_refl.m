@@ -120,6 +120,7 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
                 r->kind = NVN_RB_TBIAS; o->tbias_n = (uint16_t)tn; }
             else if ([k isEqualToString:@DMSH_KIND_DRVCB]) r->kind = [b[@"bank"] intValue] == DMSH_PUSH_BANK ? NVN_RB_PUSH : [b[@"bank"] intValue] == 2 ? NVN_RB_DRV2 : NVN_RB_DRV0;
             else if ([k isEqualToString:@DMSH_KIND_BORDER]) { if (o->border) FAIL("two border colour blocks"); r->kind = NVN_RB_BORDER; o->border = (uint8_t)(o->nb + 1); }
+            else if ([k isEqualToString:@DMSH_KIND_FOLD]) { if (o->fold) FAIL("two page-count blocks"); r->kind = NVN_RB_FOLD; o->fold = (uint8_t)(o->nb + 1); }
             else FAIL("B binding kind %s not implemented (%s)", k.UTF8String, [b[@"msl_name"] UTF8String]);
             id tx = b[@"tbx"];   // a buffer image's or buffer texture's index in the offset table, an array of buffer textures' first (dmsh_reflect.py buffer_image_bias)
             if (tx) { int x = [tx intValue], arr = r->kind == NVN_RB_TEXA;

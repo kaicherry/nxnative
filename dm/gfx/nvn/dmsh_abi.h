@@ -128,6 +128,13 @@
 #define DMSH_KIND_TEX_HTAB "tex_htab"    // a table the host builds of the handles in uniform slot reg from byte off, element k = the handle at off + 8k (nvn_mtl.m htab_gpu), laid out as a pool: elem = the element type
 #define DMSH_KIND_SAMP_HTAB "samp_htab"  // its samplers; soff and sreg as DMSH_KIND_SAMP_UBO's
 #define DMSH_KIND_BORDER "border"        // the shader's border colour block (dmsh_rewrite.py border_emu): a mask of the samplers to correct, then each one's factors
+#define DMSH_KIND_FOLD "fold"            // the shader's page-count block (dmsh_rewrite.py fold_pages): the layers Metal holds a texture taller than its 2D limit in, per texture member
+
+// A linear texture taller than Metal's 2D limit (16384 rows) is held as a 2D array of equal pages. The console's descriptor for it says 2D, so the game's v runs over the whole texture and
+// its layer is 0: a sample folds v into the page it lands in and the row within it (nvn_mtl.m tex_linear, dmsh_rewrite.py fold_pages). First case: Nintendo Switch Sports' glyph atlas,
+// 1024x32768 written by the shared-font engine, which drew one column of each glyph until the fold's arguments were in the helper's order
+#define DMSH_FOLD_MEMBER "dm_fold"       // the name of the block's member in the argument buffer
+#define DMSH_FOLD_SLOTS 32               // page counts in the block, by the argument buffer member index of the texture they belong to; 1 = not split
 
 #define DMSH_KIND_GMEM_MAP "gmem_map"    // the memory pool table for global memory the translator traced to no storage buffer (an address the shader loaded from memory): the host binds its table (nvn_mtl.m gmem_map)
 

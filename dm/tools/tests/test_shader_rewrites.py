@@ -17,6 +17,7 @@ import dmsh_atomic  # noqa: E402
 import dmsh_entry  # noqa: E402
 import dmsh_fetch  # noqa: E402
 import dmsh_reflect  # noqa: E402
+import dmsh_rewrite  # noqa: E402
 import dmsh_side  # noqa: E402
 
 ns: dict[str, Any] = {**vars(dmsh_reflect), **vars(dmsh_entry)}
@@ -166,6 +167,56 @@ class ImageAtomics(unittest.TestCase):
         for src in ('spvImage2DAtomicCoord(x)', 'device atomic_uint* t_atomic'):
             with self.assertRaises(ValueError): dmsh_atomic.check_msl(src)
         self.assertEqual(dmsh_atomic.check_msl('float4 x;'), 'float4 x;')
+
+
+class PageFold(unittest.TestCase):
+    """dmsh_rewrite.fold_pages: the page count lands after the layer, where the helpers declare it (dm_fs / dm_fc take uv, layer, n; dm_fr takes xy, layer, n). The other
+    order compiles and folds nothing: n takes the layer's value (0 in every draw seen) and the layer takes the page count, so every sample reads a page the texture does not
+    have (Nintendo Switch Sports' glyph atlas drew one column of each glyph, unread from its pages)."""
+    HEAD = ('using namespace metal;\n'
+            'struct spvDescriptorSetBuffer0\n{\n'
+            '    texture2d_array<float> t_a [[id(0)]];\n'
+            '    sampler s0 [[id(1)]];\n'
+            '    texture2d<float> t_plain [[id(2)]];\n'
+            '    sampler s1 [[id(3)]];\n};\n')
+
+    def fold(self, body):
+        return dmsh_rewrite.fold_pages(self.HEAD + 'float4 f(float2 uv, uint page, uint2 xy, float4 cmp)\n{\n    ' + body + ';\n}\n')
+
+    def test_a_sample_folds_after_its_layer(self):
+        out = self.fold('float4 c = spvDescriptorSet0.t_a.sample(spvDescriptorSet0.s0, uv, page, level(0))')
+        self.assertIn('dm_fs(spvDescriptorSet0.t_a, spvDescriptorSet0.s0, uv, page, spvDescriptorSet0.dm_fold->n[0], level(0))', out)
+
+    def test_a_sample_compare_folds_after_its_layer(self):
+        out = self.fold('float4 c = spvDescriptorSet0.t_a.sample_compare(spvDescriptorSet0.s0, uv, page, cmp)')
+        self.assertIn('dm_fc(spvDescriptorSet0.t_a, spvDescriptorSet0.s0, uv, page, spvDescriptorSet0.dm_fold->n[0], cmp)', out)
+
+    def test_a_texel_fetch_folds_after_its_layer(self):
+        out = self.fold('float4 c = spvDescriptorSet0.t_a.read(xy, page)')
+        self.assertIn('dm_fr(spvDescriptorSet0.t_a, xy, page, spvDescriptorSet0.dm_fold->n[0])', out)
+
+    def test_a_texel_fetch_of_a_mip_level_keeps_the_level(self):
+        # Metal's texture2d_array read takes (coord, slice, level): the page count goes in before the level and the helper passes it through
+        out = self.fold('float4 c = spvDescriptorSet0.t_a.read(xy, page, 0u)')
+        self.assertIn('dm_fr(spvDescriptorSet0.t_a, xy, page, spvDescriptorSet0.dm_fold->n[0], 0u)', out)
+
+    def test_the_fetch_helper_takes_the_arguments_past_the_page_count(self):
+        # a read of a mip level hands dm_fr one argument more than (texture, coord, layer, n): a fixed parameter list refused it (30 of Splatoon Raiders' shaders)
+        self.assertIn('auto dm_fr(V t, C xy, uint layer, uint n, A... a)', dmsh_rewrite.FOLD_HELPERS)
+
+    def test_a_border_colour_twin_folds_the_same_coordinates(self):
+        out = self.fold('float4 c = dm_bs(spvDescriptorSet0.t_a.sample(spvDescriptorSet0.s0, uv, page), p, 0u, spvDescriptorSet0.t_a, w, uv, page)')
+        self.assertIn('dm_fuv(uv, spvDescriptorSet0.dm_fold->n[0])', out)
+        self.assertIn('dm_fpage(uv, page, spvDescriptorSet0.dm_fold->n[0])', out)
+
+    def test_the_fold_member_takes_the_argument_past_every_other(self):
+        out = self.fold('float4 c = spvDescriptorSet0.t_a.sample(spvDescriptorSet0.s0, uv, page)')
+        self.assertIn('constant dm_fold_t* dm_fold [[id(4)]];', out)
+
+    def test_a_plain_2d_texture_is_left_alone(self):
+        out = self.fold('float4 c = spvDescriptorSet0.t_plain.sample(spvDescriptorSet0.s1, uv)')
+        self.assertNotIn('dm_fs(', out)
+        self.assertEqual(out, self.HEAD + 'float4 f(float2 uv, uint page, uint2 xy, float4 cmp)\n{\n    float4 c = spvDescriptorSet0.t_plain.sample(spvDescriptorSet0.s1, uv);\n}\n')
 
 
 if __name__ == '__main__':

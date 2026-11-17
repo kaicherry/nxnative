@@ -748,6 +748,7 @@ static void as_drop_pool(const void *pool);   // caller holds g_mu, shared with 
 static uint64_t g_pool_adds;
 static int g_pool_res_n;   // registered pools already in the residency set (for the memory readout; under g_mu)
 static __thread int t_tex_upload_lookup;   // set around a texture upload's read of its storage (pool lookups counted apart, mem_census)
+static __thread const uint8_t *t_cur_shader_key;   // the shader whose arguments are being encoded (for tex_linear's red line)
 
 #define C1_BANK_SIZE (4u << 20)
 #define C1_DECL_SIZE (64u << 10)
@@ -2835,7 +2836,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); snap_dra
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[175];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
+static int g_red_once[180];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
 #define RED_ONCE(k, ...) do { _Static_assert((k) < sizeof g_red_once / sizeof *g_red_once, "a RED_ONCE key past g_red_once: raise its size"); if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -4324,16 +4325,94 @@ static int linear_storage_ok(const tex_t *t) {
 }
 // Linear textures (LINEAR) in a CPU-visible pool: the game writes the pool memory directly from the CPU (SMBW's glyph cache: 2048×8192 R8, IMAGE|LINEAR, pool CPU_UNCACHED|GPU_CACHED,
 // the font engine rasterizes glyphs into it on the CPU). A GPU-private texture never sees those writes → all menu / dialog text is blank. On unified memory, create a linear texture directly on the pool buffer (zero copy): the GPU reads the current content at execution time, same as NVN.
+// A linear texture taller than Metal's 2D limit (16384 rows) cannot share its storage: a Metal buffer makes a 2D texture or a buffer texture only, no array. Its rows go
+// into a shared 2D array instead, refreshed by the dirty pages the game's own writes leave. Nintendo Switch Sports' glyph atlas is 1024×32768: two layers of 16384 rows,
+// which its text shader samples as a texture array
+typedef struct { uint64_t serial; const void *span; uint64_t stamp; uint32_t layers; } split_tex_rec;
+enum { SPLIT_TEX_MAX = 8 };
+static split_tex_rec g_split_tex[SPLIT_TEX_MAX]; static int g_split_tex_n;
+static int split_tex_upload(id<MTLTexture> mt, const tex_t *t) {
+    if (!t->mem || mt.textureType != MTLTextureType2DArray || !mt.arrayLength || !mt.height) return 0;
+    NSUInteger row = t->d.stride ? t->d.stride : (NSUInteger)(t->d.height ? t->L.size / t->d.height : 0);
+    if (!row || row < mt.width) return 0;
+    for (NSUInteger s = 0; s < mt.arrayLength; s++)
+        [mt replaceRegion:MTLRegionMake2D(0, 0, mt.width, mt.height) mipmapLevel:0 slice:s withBytes:(const uint8_t *)t->mem + (size_t)s * mt.height * row
+               bytesPerRow:row bytesPerImage:row * mt.height];
+    return 1;
+}
+static void split_tex_record(uint64_t serial, const void *span, uint64_t stamp, uint32_t layers) {
+    for (int i = 0; i < g_split_tex_n; i++) if (g_split_tex[i].serial == serial) { g_split_tex[i].span = span; g_split_tex[i].stamp = stamp; g_split_tex[i].layers = layers; return; }
+    int at = g_split_tex_n < SPLIT_TEX_MAX ? g_split_tex_n++ : g_split_tex_n % SPLIT_TEX_MAX;   // a game reads a few of them at most
+    g_split_tex[at] = (split_tex_rec){.serial = serial, .span = span, .stamp = stamp, .layers = layers};
+}
+// The pages a texture taller than Metal's 2D limit is held in, for the shader that samples it: its v runs over the whole texture, so the sample folds it into
+// a page and a row (dmsh_rewrite.py fold_pages). 1 for every other texture, which leaves the coordinate as the game gave it
+static uint32_t split_tex_pages(uint64_t serial) {
+    for (int i = 0; i < g_split_tex_n; i++) if (g_split_tex[i].serial == serial) return g_split_tex[i].layers;
+    return 1;
+}
+static void split_tex_refresh(const tex_t *t) {   // the array's rows again when the game wrote the storage since the last upload
+    for (int i = 0; i < g_split_tex_n; i++) if (g_split_tex[i].serial == t->serial) {
+        uint64_t now = nvn_dirty_now();
+        if (!t->mem || now == g_split_tex[i].stamp || !nvn_dirty_since_span(g_split_tex[i].span, t->mem, t->L.size, g_split_tex[i].stamp)) return;
+        id mt = tex_get(t->serial);
+        // Protect before reading, as a packaged texture's upload does: a page stays writable after the write that faulted on it, so without this only the game's first write to a page
+        // was ever seen and the glyphs it rasterized later never reached the array (the text stayed at the first upload's state: missing and wrong glyphs on every later screen)
+        if (mt) { nvn_dirty_protect(t->mem, t->L.size); split_tex_upload((id<MTLTexture>)mt, t); }
+        g_split_tex[i].stamp = now;
+        return;
+    }
+}
 static id<MTLTexture> tex_linear(const tex_t *t) {
     uint32_t pf = 0; void *mb; uint64_t mo; size_t row;
     int fit = linear_fit(t, &pf, &mb, &mo, &row);
     if (fit < 0) RED_ONCE(65, "linear texture %ux%u format %#x flags %#x: rows of %zu bytes no view can take, a private texture the CPU's writes do not reach (the GPU wrote its storage, or first used off the submit thread)",
                           t->d.width, t->d.height, t->d.format, t->d.flags, row);
     if (fit != 1) return nil;
+    // Metal's 2D limit is 16384 rows, and its process aborts on a descriptor past it (tex_desc catches block-linear ones the same way). A taller linear texture is
+    // held as a 2D array of equal pages of the same memory (a page is contiguous rows at the same pitch, so the bytes are identical), and every shader that samples it
+    // folds its v into the page (dmsh_rewrite.py fold_pages): the game's v runs over the whole texture, as it does on the console, where the descriptor says 2D and the
+    // array coordinate is nobody's. Nintendo Switch Sports' glyph atlas is 1024×32768, two pages of 16384 rows
+    NSUInteger W = t->d.width ? t->d.width : 1, H = t->d.height ? t->d.height : 1, layers = 1;
+    NSUInteger block = 16384;   // rows per page; DM_NVN_TEX_LAYER_ROWS overrides it, for a game whose own layout is in smaller pages
+    { const char *e = getenv("DM_NVN_TEX_LAYER_ROWS"); if (e && *e && atoi(e) > 0) block = (NSUInteger)atoi(e); }
+    if (H > 16384) {
+        if (t->d.target != NVN_TEXTURE_TARGET_2D || t->d.depth > 1) {   // only a plain 2D texture: a layered one's rows are its layers', not the v of a sample
+            RED_ONCE(173, "linear texture %ux%ux%u format %#x target %d flags %#x is past Metal's 2D limit and is not a plain 2D texture: not made, its samples read 0 (first read by shader %s)",
+                     t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.flags, t_cur_shader_key ? (const char *)t_cur_shader_key : "?");
+            return nil;
+        }
+        if (block > H || H % block || H / block > 2048) {
+            RED_ONCE(174, "linear texture %ux%ux%u format %#x target %d flags %#x is past Metal's 2D limit and its rows do not split into %lu-row pages: not made, its samples read 0 (first read by shader %s)",
+                     t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.flags, (unsigned long)block, t_cur_shader_key ? (const char *)t_cur_shader_key : "?");
+            return nil;
+        }
+        layers = H / block; H = block;
+    }
+    if (W > 16384) {
+        RED_ONCE(174, "linear texture %ux%ux%u format %#x is wider than Metal's 16384: not made, its samples read 0 (first read by shader %s)",
+                 t->d.width, t->d.height, t->d.depth, t->d.format, t_cur_shader_key ? (const char *)t_cur_shader_key : "?");
+        return nil;
+    }
     id<MTLBuffer> b = (__bridge id<MTLBuffer>)mb;
-    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)pf width:t->d.width ? t->d.width : 1 height:t->d.height ? t->d.height : 1 mipmapped:NO];
+    MTLTextureUsage usage = MTLTextureUsageShaderRead | img_usage(t, (MTLPixelFormat)pf) | (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET ? MTLTextureUsageRenderTarget : 0);
+    if (layers > 1) {   // a Metal buffer makes a 2D texture or a buffer texture only, no array: a shared 2D array holds the rows, refreshed when the game writes them (split_tex_refresh)
+        MTLTextureDescriptor *d = [MTLTextureDescriptor new];
+        d.textureType = MTLTextureType2DArray; d.pixelFormat = (MTLPixelFormat)pf; d.width = W; d.height = H; d.arrayLength = layers; d.mipmapLevelCount = 1;
+        d.storageMode = MTLStorageModeShared; d.usage = usage;
+        id<MTLTexture> mt = [g_dev newTextureWithDescriptor:d];
+        if (!mt) return nil;
+        // Take the stamp, protect, then read, as pkg_upload: the game writes the glyph cache from the CPU, and a write after this faults and is seen at the next refresh (split_tex_refresh)
+        uint64_t st = nvn_dirty_now();
+        nvn_dirty_protect(t->mem, t->L.size);
+        split_tex_upload(mt, t);
+        split_tex_record(t->serial, nvn_dirty_span(t->mem, t->L.size), st, (uint32_t)layers);
+        MLOG("linear texture %ux%u held as a 2D array of %lu pages of %lux%lu (Metal's 2D limit; uploaded from its storage)", t->d.width, t->d.height, (unsigned long)layers, (unsigned long)W, (unsigned long)H);
+        return mt;
+    }
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)pf width:W height:H mipmapped:NO];
     d.resourceOptions = b.resourceOptions;
-    d.usage = MTLTextureUsageShaderRead | img_usage(t, (MTLPixelFormat)pf) | (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET ? MTLTextureUsageRenderTarget : 0);
+    d.usage = usage;
     return [b newTextureWithDescriptor:d offset:mo bytesPerRow:row];
 }
 // CPU-written block-linear textures (WriteTexels): the game gave no packaged layout and changes the content from the CPU each frame (Engage's movie frames: a Y plane R8 + a UV plane RG8, WriteTexels every frame).
@@ -7311,6 +7390,7 @@ static id<MTLTexture> tex_by_id(int tid) {   // Caller holds g_rmu
     if (g_tpool_n && tid >= g_tpool_n) { if (!g_stat_tex_oob++) MLOG("texture ID %d outside the pool (capacity %d) treated as an empty slot: reads 0", tid, g_tpool_n); return nil; }
     if (tid < 0 || tid >= g_ntreg || !g_treg[tid].ok) { RED_ONCE(10, "texture ID %d not registered", tid); return nil; }
     treg_t *rp = &g_treg[tid];
+    if (g_split_tex_n && rp->t.d.height > 16384) split_tex_refresh(&rp->t);   // a linear texture held as a 2D array (tex_linear)
     if (!g_pool_walk) rp->used = g_tu_now;   // a binding: a use (tu_pass)
     uint64_t sg = treg_ep(), dg = nvn_dirty_now();   // Take the generations first and then look up: if a change happens in between, the next time must take the slow path
     if (rp->view && rp->view_ser == sg && (!rp->view_pkg || rp->view_dirty == dg)) return (__bridge id<MTLTexture>)rp->view;
@@ -7429,7 +7509,16 @@ static NSUInteger fit_layers(id<MTLTexture> t, MTLTextureType want) {
     return 0;
 }
 static id<MTLTexture> tex_fit(int tid, id<MTLTexture> t, MTLTextureType want, uint64_t *rid) {
-    MTLTextureType have = t.textureType; NSUInteger ns = fit_layers(t, want);
+    // A view's layers are the layers of the texture it is made from: t is often a view itself (a 2D one of a 2D array, 1 layer), and describing t would ask
+    // Metal for a 1-layer array of the array's 2 pages, which drops the page past the first (Nintendo Switch Sports' glyph atlas: every sample of it read 0)
+    id<MTLTexture> base = t; NSUInteger l0 = 0, s0 = 0;
+    while (base.parentTexture) { l0 += base.parentRelativeLevel; s0 += base.parentRelativeSlice; base = base.parentTexture; }
+    // A 2D view of a layered texture says nothing about its layers, so an array the shader declares takes them all from the view's slice; every other fit takes what t covers, and no
+    // view of a view takes more slices than the texture under both has (asked for 6 + 12 of a 12-face cube array, Metal aborts)
+    MTLTextureType have = base.textureType;
+    NSUInteger all = have == MTLTextureType2D ? 1 : base.arrayLength * (have == MTLTextureTypeCube || have == MTLTextureTypeCubeArray ? 6 : 1);
+    NSUInteger ns = want == MTLTextureType2DArray && t.textureType == MTLTextureType2D ? (all > s0 ? all - s0 : 0) : fit_layers(t, want);
+    if (ns > all || ns + s0 > all) ns = all > s0 ? all - s0 : 0;
     // A one-layer 2D texture in a cube slot has no cube view (Pokémon Legends: Z-A binds one to a cube sampler on its character creation screen, a placeholder for an environment map): the zero cube,
     // a defined read, instead of a type mismatch whose reads are undefined. The same for a 2D array of fewer than 6 layers, which is how the host holds some 2D textures (Mario Kart 8 Deluxe binds
     // an NVN 2D texture, format 0x44, at slot 10 of two pixel shaders that declare a cube there, as a race loads)
@@ -7452,8 +7541,6 @@ static id<MTLTexture> tex_fit(int tid, id<MTLTexture> t, MTLTextureType want, ui
     // Made from the texture under t, with t's levels, slices and swizzle: Metal takes a view's residency from the texture it was made from, and t is often a view itself (the view
     // cache's). A view of it read as not resident although the texture under both is in the residency set (shader validation, "Texture is not resident": Breath of the Wild's
     // 64x64 cube read from a 2D-array view, found with nvn_replay); such reads are undefined
-    id<MTLTexture> base = t; NSUInteger l0 = 0, s0 = 0;
-    while (base.parentTexture) { l0 += base.parentRelativeLevel; s0 += base.parentRelativeSlice; base = base.parentTexture; }
     id<MTLTexture> v = [base newTextureViewWithPixelFormat:t.pixelFormat textureType:want levels:NSMakeRange(l0, t.mipmapLevelCount) slices:NSMakeRange(s0, ns) swizzle:t.swizzle];
     if (!v) { RED_ONCE(77, "cannot create a type-compatible texture view: %lu → %lu (texture ID %d)", (unsigned long)have, (unsigned long)want, tid); return nil; }
     r->alt = (void *)CFBridgingRetain(v); r->alt_of = (__bridge void *)t; r->alt_type = (uint8_t)want; r->alt_rid = v.gpuResourceID._impl;
@@ -12766,6 +12853,8 @@ static int encode_args_full(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stag
             int snap = fb_snapshot_slot(nvn_stage, t);
             if (snap >= 0) { t = g_fb_use[snap]; trid = g_fb_rid[snap]; }
             if (t && passdump() && tid < g_ntreg) PD("R %llu st%d ser=%llu", g_stat_pass, nvn_stage, g_treg[tid].t.serial);
+            // A linear texture the game writes from the CPU (its glyph atlas) and Metal holds as pages: the pages take the writes made since the last upload, before the draw reads them
+            if (t && tid && tid < g_ntreg && g_treg[tid].t.d.height > 16384 && g_treg[tid].t.mem) split_tex_refresh(&g_treg[tid].t);
             if (bl) PD("B %llu st%d tex reg%d tid=%d %s ser=%llu fmt=%lu %lux%lux%lu view_lv=%lu+%lu view_sl=%lu array=%lu target=%lu swz=%d%d%d%d mtl=%p", g_stat_pass, nvn_stage, reg, tid, t ? "real" : "dummy", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull,
                        (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth,
                        (unsigned long)(t.parentTexture ? t.parentRelativeLevel : 0), (unsigned long)t.mipmapLevelCount,
@@ -12779,6 +12868,13 @@ static int encode_args_full(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stag
             if (t && b->dpf == NVN_DPF_FLOAT && mtl_pf_dpf(t.pixelFormat) != NVN_DPF_FLOAT) { uint64_t r2 = 0; id<MTLTexture> v = tex_float_fit(tid, t, &r2); if (v) { t = v; trid = r2; } }   // see tex_float_fit
             if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt % DMY_NT][b->dpf & 3]; }
             else if (b->dtt == (uint8_t)MTLTextureTypeTextureBuffer) t = tbuf_shadow(tid, t, &trid);   // see tbuf_shadow
+            // A texture taller than Metal's 2D limit is held in pages, which only an array sample reaches: the chain folds v into them for a texture2d_array member (dmsh_rewrite.py
+            // fold_pages). A shader that declares the texture 2D reads the first page alone, so its other pages are silently unreachable
+            if (t && (MTLTextureType)b->dtt == MTLTextureType2D && tid > 0 && tid < g_ntreg && g_split_tex_n) {
+                uint32_t pages = split_tex_pages(g_treg[tid].t.serial);
+                if (pages > 1) RED_ONCE(179, "shader %s samples texture %d, held as %u pages of a linear texture taller than Metal's 2D limit, as a plain 2D texture: every page past the first is unreachable (only a texture2d_array sample is folded, dmsh_rewrite.py fold_pages)",
+                                         sh->key, tid, pages);
+            }
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_IMG || b->kind == NVN_RB_IMGU) {   // Storage image: NVN image slot r (BindImages) ↔ D3D u_r, or its handle in a uniform buffer (IMGU)
@@ -12996,8 +13092,22 @@ static int encode_args_full(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stag
                 slots[aid] = g_cur_arena->gpu + doff;
                 USE(db, MTLResourceUsageRead);
             }
-        } else if (b->kind == NVN_RB_BORDER) continue;   // filled below, once every twin has been seen
+        } else if (b->kind == NVN_RB_BORDER || b->kind == NVN_RB_FOLD) continue;   // filled below, once every twin / texture has been seen
         else RED_ONCE(46, "binding kind %d not implemented", b->kind);
+    }
+    if (sh->rf.fold) {   // the page counts of the textures it folds v into (dmsh_rewrite.py fold_pages), by argument buffer member: the layers a split
+                         // texture is held in, 1 for one that fits Metal's 2D limit, which leaves the sample's coordinate and layer as the game gave them
+        int reg = 0, aid = sh->rf.b[sh->rf.fold - 1].aid;   // reg: USE's resource check names the slot's register
+        id<MTLBuffer> db; size_t doff = arena_alloc(DMSH_FOLD_SLOTS * 4u, &db); uint32_t *pn = (uint32_t *)(void *)(g_cur_arena->cpu + doff);
+        memset(pn, 0, DMSH_FOLD_SLOTS * 4u);
+        for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *tb = &sh->rf.b[i];
+            if (tb->kind != NVN_RB_TEX && tb->kind != NVN_RB_TEXU) continue;
+            if (tb->aid >= DMSH_FOLD_SLOTS) { RED_ONCE(178, "shader %s samples a texture at argument %d, past the %d page counts the block holds: it folds none of them", sh->key, tb->aid, DMSH_FOLD_SLOTS); continue; }
+            int tid = tb->kind == NVN_RB_TEXU ? ubo_tex_id(ubo_bind_handle(nvn_stage, tb)) : (int)(bound_tex(nvn_stage, tb->reg) & 0xfffff);
+            pn[tb->aid] = tid && tid < g_ntreg ? split_tex_pages(g_treg[tid].t.serial) : 1;
+        }
+        slots[aid] = g_cur_arena->gpu + doff; USE(db, MTLResourceUsageRead);
+        if (bl) PD("B %llu st%d fold n=%u,%u,%u,%u (%u textures)", g_stat_pass, nvn_stage, pn[0], pn[1], pn[2], pn[3], (unsigned)sh->rf.nb);
     }
     if (sh->rf.border) {   // the border colour block: all zero (the shared zero bank) unless a twin corrects, then its mask and factors (dmsh_abi.h DMSH_BORDER_*)
         int reg = 0, aid = sh->rf.b[sh->rf.border - 1].aid;
