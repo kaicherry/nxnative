@@ -55,8 +55,8 @@ class Game:
         folder = Path(folder)
         return [m for m in self.words('modules', 'main') if (folder / m).is_file() or (folder / f'{m}.patched.bin').is_file()]
 
-    def pairs(self, key):   # "a=b c=d" → [(a, b), (c, d)]
-        return [tuple(w.split('=', 1)) for w in self.words(key)]
+    def pairs(self, key, default=None):   # "a=b c=d" → [(a, b), (c, d)]
+        return [tuple(w.split('=', 1)) for w in self.words(key, default or '')]
 
 
 def extra_dirs():   # profile folders outside the repository (DM_GAMES_DIR), searched after dm/games
